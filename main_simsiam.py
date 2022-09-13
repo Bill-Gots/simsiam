@@ -90,6 +90,10 @@ parser.add_argument('--pred-dim', default=512, type=int,
 parser.add_argument('--fix-pred-lr', action='store_true',
                     help='Fix learning rate for the predictor')
 
+# partition ratio:
+parser.add_argument('--annotation-ratio', default=0.01, type=float,
+                    help='annotation ratio of the data (default: 0.01)')
+
 def main():
     args = parser.parse_args()
 
@@ -225,6 +229,8 @@ def main_worker(gpu, ngpus_per_node, args):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
+    no_augmentation = [transforms.ToTensor(), normalize]
+
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
     augmentation = [
         transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
@@ -238,26 +244,40 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize
     ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    train_dataset = datasets.CIFAR10(args.data, train = True, download = False, transform = None)
+    n = len(train_dataset)
+    i_supervised = random.sample(range(0, n), int(args.annotation_ratio * n))
+    supervised_dataset = transforms.Compose(no_augmentation)(
+        torch.utils.data.Subset(train_dataset, i_supervised))
+    unsupervised_dataset = transforms.Compose(augmentation)(
+        torch.utils.data.Subset(train_dataset, list(set(range(0, n)).difference(set(i_supervised)))))
+
+    '''train_dataset = datasets.ImageFolder(traindir,
+        transform = simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))'''
 
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        supervised_sampler = torch.utils.data.distributed.DistributedSampler(supervised_dataset)
+        unsupervised_sampler = torch.utils.data.distributed.DistributedSampler(unsupervised_dataset)
     else:
-        train_sampler = None
+        supervised_sampler = None
+        unsupervised_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size = args.batch_size, shuffle = (train_sampler is None),
-        num_workers = args.workers, pin_memory = True, sampler = train_sampler, drop_last=True)
+    supervised_loader = torch.utils.data.DataLoader(
+        supervised_dataset, batch_size = args.batch_size, shuffle = (supervised_sampler is None),
+        num_workers = args.workers, pin_memory = True, sampler = supervised_sampler, drop_last=True)
+
+    unsupervised_loader = torch.utils.data.DataLoader(
+        unsupervised_dataset, batch_size = args.batch_size, shuffle = (unsupervised_sampler is None),
+        num_workers = args.workers, pin_memory = True, sampler = unsupervised_sampler, drop_last=True)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            train_sampler.set_epoch(epoch)
+            supervised_sampler.set_epoch(epoch)
+            unsupervised_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(supervised_loader, unsupervised_loader, model, criterion, optimizer, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -269,12 +289,12 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(supervised_loader, unsupervised_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
     progress = ProgressMeter(
-        len(train_loader),
+        len(supervised_loader + unsupervised_loader),
         [batch_time, data_time, losses],
         prefix="Epoch: [{}]".format(epoch))
 
@@ -282,13 +302,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, _) in enumerate(unsupervised_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            images[0] = images[0].cuda(args.gpu, non_blocking = True)
+            images[1] = images[1].cuda(args.gpu, non_blocking = True)
 
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
